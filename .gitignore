@@ -1,0 +1,72 @@
+*_video
+*_video.py
+extras/
+
+# output dir
+.DS_Store
+output
+outputs
+datasets/cityscapes
+wandb
+instant_test_output
+inference_test_output
+250_16_convnext_l_oneformer_cityscapes_90k.pth
+cuda_12.4.0_550.54.14_linux.run
+cuda_12.4.0_550.54.14_linux.run.1
+cuda_12.4.0_550.54.14_linux.run.2
+gtFine_trainvaltest.zip
+gtFine_trainvaltest.zip.1
+leftImg8bit_trainvaltest.zip
+matches.json
+
+*.json
+*.diff
+*.jpg
+!/projects/DensePose/doc/images/*.jpg
+
+# compilation and distribution
+__pycache__
+_ext
+*.pyc
+*.pyd
+*.so
+*.dll
+*.egg-info/
+build/
+dist/
+wheels/
+cityscapesScripts/
+
+# pytorch/python/numpy formats
+*.pth
+*.pkl
+*.npy
+*.ts
+model_ts*.txt
+
+# ipython/jupyter notebooks
+**/.ipynb_checkpoints/
+
+# Editor temporaries
+*.swn
+*.swo
+*.swp
+*~
+
+# editor settings
+.idea
+.vscode
+_darcs
+
+# project dirs
+/detectron2/model_zoo/configs
+/projects/*/datasets
+/models
+/snippet
+/oneformer/modeling/pixel_decoder/ops/cuda-repo-ubuntu2004-12-1-local_12.1.0-530.30.02-1_amd64.deb
+/colab/
+/detectron2/
+/cookies.txt
+/index.html
+/index.html.1
+/index.html.2
