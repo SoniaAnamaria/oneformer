@@ -4,6 +4,8 @@
 # ------------------------------------------------------------------------------
 
 import logging
+from collections import OrderedDict
+
 import fvcore.nn.weight_init as weight_init
 from typing import Optional
 import torch
@@ -18,6 +20,7 @@ from .transformer import Transformer
 
 from detectron2.utils.registry import Registry
 
+from .vmamba import VSSBlock, SS2D
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
 TRANSFORMER_DECODER_REGISTRY.__doc__ = """
@@ -314,37 +317,40 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         # define Transformer decoder here
         self.num_heads = nheads
         self.num_layers = dec_layers
-        self.transformer_self_attention_layers = nn.ModuleList()
-        self.transformer_cross_attention_layers = nn.ModuleList()
-        self.transformer_ffn_layers = nn.ModuleList()
+        self.channel_first = False
+        downsample_version: str = "v2"
+        use_checkpoint = False
+        dpr = [x.item() for x in torch.linspace(0, 0.1, self.num_layers)]
 
+        self.layers = nn.ModuleList()
         for _ in range(self.num_layers):
-            self.transformer_self_attention_layers.append(
-                SelfAttentionLayer(
-                    d_model=hidden_dim,
-                    nhead=nheads,
-                    dropout=0.0,
-                    normalize_before=pre_norm,
-                )
-            )
+            for i_layer in range(self.num_layers):
+                downsample = nn.Identity()
 
-            self.transformer_cross_attention_layers.append(
-                CrossAttentionLayer(
-                    d_model=hidden_dim,
-                    nhead=nheads,
-                    dropout=0.0,
-                    normalize_before=pre_norm,
-                )
-            )
-
-            self.transformer_ffn_layers.append(
-                FFNLayer(
-                    d_model=hidden_dim,
-                    dim_feedforward=dim_feedforward,
-                    dropout=0.0,
-                    normalize_before=pre_norm,
-                )
-            )
+                self.layers.append(self._make_layer(
+                    dim=hidden_dim,
+                    drop_path=dpr,
+                    use_checkpoint=use_checkpoint,
+                    downsample=downsample,
+                    channel_first=self.channel_first,
+                    # =================
+                    ssm_d_state=16,
+                    ssm_ratio=2.0,
+                    ssm_dt_rank="auto",
+                    ssm_act_layer=nn.SiLU,
+                    ssm_conv=3,
+                    ssm_conv_bias=True,
+                    ssm_drop_rate=0.0,
+                    ssm_init="v0",
+                    forward_type="v2",
+                    # =================
+                    mlp_ratio=4.0,
+                    mlp_act_layer=nn.GELU,
+                    mlp_drop_rate=0.0,
+                    gmlp=False,
+                    # =================
+                    _SS2D=SS2D,
+                ))
 
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
@@ -370,6 +376,58 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         if self.mask_classification:
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+
+    @staticmethod
+    def _make_layer(
+            dim=96,
+            drop_path=[0.1, 0.1],
+            use_checkpoint=False,
+            downsample=nn.Identity(),
+            channel_first=False,
+            # ===========================
+            ssm_d_state=16,
+            ssm_ratio=2.0,
+            ssm_dt_rank="auto",
+            ssm_act_layer=nn.SiLU,
+            ssm_conv=3,
+            ssm_conv_bias=True,
+            ssm_drop_rate=0.0,
+            ssm_init="v0",
+            forward_type="v2",
+            # ===========================
+            mlp_ratio=4.0,
+            mlp_act_layer=nn.GELU,
+            mlp_drop_rate=0.0,
+            # ===========================
+            **kwargs,
+    ):
+        # if channel first, then Norm and Output are both channel_first
+        depth = len(drop_path)
+        blocks = []
+        for d in range(depth):
+            blocks.append(VSSBlock(
+                hidden_dim=dim,
+                drop_path=drop_path[d],
+                channel_first=channel_first,
+                ssm_d_state=ssm_d_state,
+                ssm_ratio=ssm_ratio,
+                ssm_dt_rank=ssm_dt_rank,
+                ssm_act_layer=ssm_act_layer,
+                ssm_conv=ssm_conv,
+                ssm_conv_bias=ssm_conv_bias,
+                ssm_drop_rate=ssm_drop_rate,
+                ssm_init=ssm_init,
+                forward_type=forward_type,
+                mlp_ratio=mlp_ratio,
+                mlp_act_layer=mlp_act_layer,
+                mlp_drop_rate=mlp_drop_rate,
+                use_checkpoint=use_checkpoint,
+            ))
+
+        return nn.Sequential(OrderedDict(
+            blocks=nn.Sequential(*blocks, ),
+            downsample=downsample,
+        ))
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
