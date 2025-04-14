@@ -317,40 +317,39 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         # define Transformer decoder here
         self.num_heads = nheads
         self.num_layers = dec_layers
-        self.channel_first = False
+        self.channel_first = True
         downsample_version: str = "v2"
         use_checkpoint = False
         dpr = [x.item() for x in torch.linspace(0, 0.1, self.num_layers)]
 
         self.layers = nn.ModuleList()
         for _ in range(self.num_layers):
-            for i_layer in range(self.num_layers):
-                downsample = nn.Identity()
+            downsample = nn.Identity()
 
-                self.layers.append(self._make_layer(
-                    dim=hidden_dim,
-                    drop_path=dpr,
-                    use_checkpoint=use_checkpoint,
-                    downsample=downsample,
-                    channel_first=self.channel_first,
-                    # =================
-                    ssm_d_state=16,
-                    ssm_ratio=2.0,
-                    ssm_dt_rank="auto",
-                    ssm_act_layer=nn.SiLU,
-                    ssm_conv=3,
-                    ssm_conv_bias=True,
-                    ssm_drop_rate=0.0,
-                    ssm_init="v0",
-                    forward_type="v2",
-                    # =================
-                    mlp_ratio=4.0,
-                    mlp_act_layer=nn.GELU,
-                    mlp_drop_rate=0.0,
-                    gmlp=False,
-                    # =================
-                    _SS2D=SS2D,
-                ))
+            self.layers.append(self._make_layer(
+                dim=hidden_dim,
+                drop_path=dpr,
+                use_checkpoint=use_checkpoint,
+                downsample=downsample,
+                channel_first=self.channel_first,
+                # =================
+                ssm_d_state=16,
+                ssm_ratio=2.0,
+                ssm_dt_rank="auto",
+                ssm_act_layer=nn.SiLU,
+                ssm_conv=3,
+                ssm_conv_bias=True,
+                ssm_drop_rate=0.0,
+                ssm_init="v0",
+                forward_type="v2",
+                # =================
+                mlp_ratio=4.0,
+                mlp_act_layer=nn.GELU,
+                mlp_drop_rate=0.0,
+                gmlp=False,
+                # =================
+                _SS2D=SS2D,
+            ))
 
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
@@ -510,24 +509,8 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
-            # attention: cross-attention first
-            output = self.transformer_cross_attention_layers[i](
-                output, src[level_index],
-                memory_mask=attn_mask,
-                memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
-            )
 
-            output = self.transformer_self_attention_layers[i](
-                output, tgt_mask=None,
-                tgt_key_padding_mask=None,
-                query_pos=query_embed
-            )
-            
-            # FFN
-            output = self.transformer_ffn_layers[i](
-                output
-            )
+            output = self.layers[i](output)
 
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], i=i+1)
             predictions_class.append(outputs_class)
