@@ -1063,10 +1063,6 @@ class Linear(nn.Linear):
             if len(x.shape) == 4:
                 return F.conv2d(x, self.weight[:, :, None, None], self.bias, groups=self.groups)
             elif len(x.shape) == 3:
-                input_proj = nn.Conv1d(2, 256, kernel_size=1)
-                x = x.to(dtype=torch.float32, device=input_proj.weight.device)
-                x = input_proj(x)
-                x = x.to(dtype=torch.float16, device=self.weight.device)
                 return F.conv1d(x, self.weight[:, :, None], self.bias, groups=self.groups)
         else:
             return F.linear(x, self.weight, self.bias)
@@ -1091,11 +1087,11 @@ class LayerNorm(nn.LayerNorm):
     def forward(self, x: torch.Tensor):
         # print('*******************')
         # print(f"x shape: {x.shape}")
-        # if self.in_channel_first:
-        #     x = x.permute(0, 2, 3, 1)
+        if self.in_channel_first:
+            x = x.permute(0, 2, 3, 1)
         x = nn.LayerNorm.forward(self, x)
-        # if self.out_channel_first:
-        #     x = x.permute(0, 3, 1, 2)
+        if self.out_channel_first:
+            x = x.permute(0, 3, 1, 2)
         return x
 
 
@@ -1532,7 +1528,7 @@ class SS2Dv2:
 
         # print('*******************')
         # print(f"x shape: {x.shape}")
-        x = x.view(2, 256, 250, 256)
+
         B, D, H, W = x.shape
         N = self.d_state
         K, D, R = self.k_group, self.d_inner, self.dt_rank
@@ -1591,7 +1587,6 @@ class SS2Dv2:
                 z = self.act(z)
         if not self.channel_first:
             x = x.permute(0, 3, 1, 2).contiguous()
-        x = x.permute(1, 0, 2).contiguous()
         if self.with_dconv:
             x = self.conv2d(x) # (b, d, h, w)
         x = self.act(x)
