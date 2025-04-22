@@ -294,7 +294,6 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         """
         super().__init__()
 
-        self.permute = False
         assert mask_classification, "Only support mask classification model"
         self.mask_classification = mask_classification
         self.is_train = is_train
@@ -512,11 +511,9 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
 
             B, N, C = output.shape
-            self.permute = False
             if B == self.num_queries:
                 output = output.permute(1, 0, 2).contiguous()
                 B, N, C = output.shape
-                self.permute = True
             output = output.permute(0, 2, 1).reshape(B, C, 25, 10)
             output = self.layers[i](output)
             output = output.reshape(B, C, -1).permute(0, 2, 1)
@@ -543,12 +540,15 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, i):
-        if not self.permute:
+        if output.shape[0] != self.num_queries:
             output = output.permute(1, 0, 2).contiguous()
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output)
         mask_embed = self.mask_embed(decoder_output)
+        # print("**************")
+        # print(mask_embed.shape)
+        # print(mask_features.shape)
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         # NOTE: prediction is of higher-resolution
