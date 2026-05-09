@@ -19,7 +19,7 @@ DATASETS:
   TEST_INSTANCE: ("cityscapes_fine_instance_seg_val",)
   TEST_SEMANTIC: ("cityscapes_fine_sem_seg_val",)
 SOLVER:
-  IMS_PER_BATCH: 2
+  IMS_PER_BATCH: 8
   BASE_LR: 0.0001
   MAX_ITER: 90000
   WARMUP_FACTOR: 1.0
@@ -44,7 +44,7 @@ INPUT:
   CROP:
     ENABLED: True
     TYPE: "absolute"
-    SIZE: (256, 512)
+    SIZE: (512, 1024)
     SINGLE_CATEGORY_MAX_AREA: 1.0
   COLOR_AUG_SSD: True
   SIZE_DIVISIBILITY: -1
