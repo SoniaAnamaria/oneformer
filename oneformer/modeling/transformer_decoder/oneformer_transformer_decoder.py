@@ -328,7 +328,7 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
 
             self.layers.append(self._make_layer(
                 dim=hidden_dim,
-                drop_path=dpr,
+                drop_path=[dpr[_]],
                 use_checkpoint=use_checkpoint,
                 downsample=downsample,
                 channel_first=self.channel_first,

@@ -780,8 +780,19 @@ import time
 import torch
 import warnings
 
-
+WITH_SELECTIVESCAN_OFLEX = True
+WITH_SELECTIVESCAN_CORE = False
 WITH_SELECTIVESCAN_MAMBA = True
+try:
+    import selective_scan_cuda_oflex
+except ImportError:
+    WITH_SELECTIVESCAN_OFLEX = False
+    warnings.warn("Can not import selective_scan_cuda_oflex. This affects speed.")
+    print("Can not import selective_scan_cuda_oflex. This affects speed.", flush=True)
+try:
+    import selective_scan_cuda_core
+except ImportError:
+    WITH_SELECTIVESCAN_CORE = False
 try:
     import selective_scan_cuda
 except ImportError:
@@ -839,8 +850,8 @@ class SelectiveScanCuda(torch.autograd.Function):
     @torch.cuda.amp.custom_fwd
     def forward(ctx, u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False, oflex=True, backend=None):
         ctx.delta_softplus = delta_softplus
-        # backend = "oflex" if WITH_SELECTIVESCAN_OFLEX and (backend is None) else backend
-        # backend = "core" if WITH_SELECTIVESCAN_CORE and (backend is None) else backend
+        backend = "oflex" if WITH_SELECTIVESCAN_OFLEX and (backend is None) else backend
+        backend = "core" if WITH_SELECTIVESCAN_CORE and (backend is None) else backend
         backend = "mamba" if WITH_SELECTIVESCAN_MAMBA and (backend is None) else backend
         ctx.backend = backend
         if backend == "oflex":
@@ -881,7 +892,8 @@ def selective_scan_fn(
     oflex=True,
     backend=None,
 ):
-    fn = selective_scan_torch if backend == "torch" or (not WITH_SELECTIVESCAN_MAMBA) else SelectiveScanCuda.apply
+    WITH_CUDA = (WITH_SELECTIVESCAN_OFLEX or WITH_SELECTIVESCAN_CORE or WITH_SELECTIVESCAN_MAMBA)
+    fn = selective_scan_torch if backend == "torch" or (not WITH_CUDA) else SelectiveScanCuda.apply
     return fn(u, delta, A, B, C, D, delta_bias, delta_softplus, oflex, backend)
 
 
@@ -1433,8 +1445,8 @@ class SS2Dv2:
 
         # forward_type debug =======================================
         FORWARD_TYPES = dict(
-            v01=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="mamba", scan_force_torch=True),
-            v02=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="mamba"),
+            v01=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="oflex", scan_force_torch=True),
+            v02=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="oflex"),
             v03=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="oflex"),
             v04=partial(self.forward_corev2, force_fp32=False), # selective_scan_backend="oflex", scan_mode="cross2d"
             v05=partial(self.forward_corev2, force_fp32=False, no_einsum=True),  # selective_scan_backend="oflex", scan_mode="cross2d"
@@ -1444,7 +1456,7 @@ class SS2Dv2:
             v052dc=partial(self.forward_corev2, force_fp32=False, no_einsum=True, scan_mode="cascade2d"),
             v052d3=partial(self.forward_corev2, force_fp32=False, no_einsum=True, scan_mode=3), # debug
             # ===============================
-            v2=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="core"),
+            v2=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="oflex"),
             v3=partial(self.forward_corev2, force_fp32=False, selective_scan_backend="oflex"),
         )
         self.forward_core = FORWARD_TYPES.get(forward_type, None)
@@ -1518,7 +1530,7 @@ class SS2Dv2:
         # ==============================
         **kwargs,
     ):
-        assert selective_scan_backend in [None, "oflex", "mamba", "torch", "core"]
+        assert selective_scan_backend in [None, "oflex", "mamba", "torch"]
         _scan_mode = dict(cross2d=0, unidi=1, bidi=2, cascade2d=-1).get(scan_mode, None) if isinstance(scan_mode, str) else scan_mode # for debug
         assert isinstance(_scan_mode, int)
         delta_softplus = True
