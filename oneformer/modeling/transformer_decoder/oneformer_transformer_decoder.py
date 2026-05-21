@@ -4,8 +4,6 @@
 # ------------------------------------------------------------------------------
 
 import logging
-from collections import OrderedDict
-
 import fvcore.nn.weight_init as weight_init
 from typing import Optional
 import torch
@@ -20,7 +18,7 @@ from .transformer import Transformer
 
 from detectron2.utils.registry import Registry
 
-from .vmamba import VSSBlock, SS2D
+from .vmamba import VSSM
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
 TRANSFORMER_DECODER_REGISTRY.__doc__ = """
@@ -317,39 +315,37 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         # define Transformer decoder here
         self.num_heads = nheads
         self.num_layers = dec_layers
-        self.channel_first = True
-        downsample_version: str = "v2"
-        use_checkpoint = False
-        dpr = [x.item() for x in torch.linspace(0, 0.1, self.num_layers)]
+        self.transformer_self_attention_layers = nn.ModuleList()
+        self.transformer_cross_attention_layers = nn.ModuleList()
+        self.transformer_ffn_layers = nn.ModuleList()
 
-        self.layers = nn.ModuleList()
         for _ in range(self.num_layers):
-            downsample = nn.Identity()
+            self.transformer_self_attention_layers.append(
+                SelfAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
 
-            self.layers.append(self._make_layer(
-                dim=hidden_dim,
-                drop_path=[dpr[_]],
-                use_checkpoint=use_checkpoint,
-                downsample=downsample,
-                channel_first=self.channel_first,
-                # =================
-                ssm_d_state=16,
-                ssm_ratio=2.0,
-                ssm_dt_rank="auto",
-                ssm_act_layer=nn.SiLU,
-                ssm_conv=3,
-                ssm_conv_bias=True,
-                ssm_drop_rate=0.0,
-                ssm_init="v0",
-                forward_type="v2",
-                # =================
-                mlp_ratio=4.0,
-                mlp_act_layer=nn.GELU,
-                mlp_drop_rate=0.0,
-                gmlp=False,
-                # =================
-                _SS2D=SS2D,
-            ))
+            self.transformer_cross_attention_layers.append(
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+
+            self.transformer_ffn_layers.append(
+                FFNLayer(
+                    d_model=hidden_dim,
+                    dim_feedforward=dim_feedforward,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
 
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
@@ -376,57 +372,42 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
-    @staticmethod
-    def _make_layer(
-            dim=96,
-            drop_path=[0.1, 0.1],
-            use_checkpoint=False,
-            downsample=nn.Identity(),
-            channel_first=False,
-            # ===========================
-            ssm_d_state=16,
-            ssm_ratio=2.0,
-            ssm_dt_rank="auto",
-            ssm_act_layer=nn.SiLU,
-            ssm_conv=3,
-            ssm_conv_bias=True,
-            ssm_drop_rate=0.0,
-            ssm_init="v0",
-            forward_type="v2",
-            # ===========================
-            mlp_ratio=4.0,
-            mlp_act_layer=nn.GELU,
-            mlp_drop_rate=0.0,
-            # ===========================
-            **kwargs,
-    ):
-        # if channel first, then Norm and Output are both channel_first
-        depth = len(drop_path)
-        blocks = []
-        for d in range(depth):
-            blocks.append(VSSBlock(
-                hidden_dim=dim,
-                drop_path=drop_path[d],
-                channel_first=channel_first,
-                ssm_d_state=ssm_d_state,
-                ssm_ratio=ssm_ratio,
-                ssm_dt_rank=ssm_dt_rank,
-                ssm_act_layer=ssm_act_layer,
-                ssm_conv=ssm_conv,
-                ssm_conv_bias=ssm_conv_bias,
-                ssm_drop_rate=ssm_drop_rate,
-                ssm_init=ssm_init,
-                forward_type=forward_type,
-                mlp_ratio=mlp_ratio,
-                mlp_act_layer=mlp_act_layer,
-                mlp_drop_rate=mlp_drop_rate,
-                use_checkpoint=use_checkpoint,
+        # ===== Mask-aware query refinement with VSS-refined memory =====
+        # Refine the two lowest-res memory scales (indices 0 and 1, i.e. F_1/32 and F_1/16).
+        # F_1/8 (index 2) is left unrefined for cost/benefit reasons.
+        self.vss_refine_scales = [0, 1]
+        self.refine_from_layer = 3  # apply from decoder layer 3 onward
+
+        self.memory_vss = nn.ModuleList()
+        for _ in self.vss_refine_scales:
+            self.memory_vss.append(VSSM._make_layer(
+                dim=hidden_dim,
+                drop_path=[0.0],
+                use_checkpoint=False,
+                downsample=nn.Identity(),
+                channel_first=True,
+                ssm_d_state=16,
+                ssm_ratio=2.0,
+                ssm_dt_rank="auto",
+                ssm_act_layer=nn.SiLU,
+                ssm_conv=3,
+                ssm_conv_bias=True,
+                ssm_drop_rate=0.0,
+                ssm_init="v0",
+                forward_type="v2",
+                mlp_ratio=4.0,
+                mlp_act_layer=nn.GELU,
+                mlp_drop_rate=0.0
             ))
 
-        return nn.Sequential(OrderedDict(
-            blocks=nn.Sequential(*blocks, ),
-            downsample=downsample,
-        ))
+        # Per-refinement-layer projection, norm, gated residual scale.
+        self.refine_layer_indices = list(range(self.refine_from_layer, self.num_layers))  # [3..N-1]
+        self.refine_norm = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in self.refine_layer_indices])
+        self.refine_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in self.refine_layer_indices])
+        self.refine_gamma = nn.ParameterList([
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in self.refine_layer_indices
+        ])
+        # ===============================================================
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -469,14 +450,24 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         # disable mask, it does not affect performance
         del mask
 
+        projected = [] # keep 2D projected versions
         for i in range(self.num_feature_levels):
             size_list.append(x[i].shape[-2:])
             pos.append(self.pe_layer(x[i], None).flatten(2))
-            src.append(self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
+            proj = self.input_proj[i](x[i])  # (B, C, H, W)
+            projected.append(proj)
+            src.append(proj.flatten(2) + self.level_embed.weight[i][None, :, None])
 
             # flatten NxCxHxW to HWxNxC
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)
+
+        # ===== Precompute VSS-refined memory for mask-aware pooling =====
+        # Used only by the query-refinement step inside the loop, NOT by cross-attention.
+        refined_memory_2d = {}
+        for j, scale_idx in enumerate(self.vss_refine_scales):
+            refined_memory_2d[scale_idx] = self.memory_vss[j](projected[scale_idx])
+        # ===============================================================
 
         _, bs, _ = src[0].shape
 
@@ -509,16 +500,62 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+            # attention: cross-attention first
+            output = self.transformer_cross_attention_layers[i](
+                output, src[level_index],
+                memory_mask=attn_mask,
+                memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                pos=pos[level_index], query_pos=query_embed
+            )
 
-            B, N, C = output.shape
-            if B == self.num_queries:
-                output = output.permute(1, 0, 2).contiguous()
-                B, N, C = output.shape
-            output = output.permute(0, 2, 1).reshape(B, C, 25, 10)
-            output = self.layers[i](output)
-            output = output.reshape(B, C, -1).permute(0, 2, 1)
+            output = self.transformer_self_attention_layers[i](
+                output, tgt_mask=None,
+                tgt_key_padding_mask=None,
+                query_pos=query_embed
+            )
+            
+            # FFN
+            output = self.transformer_ffn_layers[i](
+                output
+            )
 
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], i=i+1)
+
+            # ===== Mask-aware query refinement using VSS-refined memory =====
+            if i in self.refine_layer_indices:
+                # The next layer will use scale `(i+1) % num_feature_levels`; we use the
+                # current layer's scale for pooling, which matches the resolution at which
+                # this layer's cross-attention operated.
+                pool_scale = level_index
+                if pool_scale in refined_memory_2d:
+                    F_refined = refined_memory_2d[pool_scale]  # (B, C, H, W)
+                    B, C, H, W = F_refined.shape
+
+                    # outputs_mask is at mask_features resolution (typically F_1/4).
+                    # Downsample mask to F_refined's resolution before pooling.
+                    mask_for_pool = F.interpolate(
+                        outputs_mask, size=(H, W), mode="bilinear", align_corners=False
+                    )  # (B, Q, H, W)
+                    w = mask_for_pool.sigmoid()  # (B, Q, H, W)
+
+                    # Mask-weighted average pooling
+                    w_flat = w.flatten(2)  # (B, Q, H*W)
+                    F_flat = F_refined.flatten(2)  # (B, C, H*W)
+                    num = torch.einsum("bqp,bcp->bqc", w_flat, F_flat)  # (B, Q, C)
+                    den = w_flat.sum(dim=-1, keepdim=True).clamp_min(1e-6)  # (B, Q, 1)
+                    pooled = num / den  # (B, Q, C)
+
+                    # output is (Q, B, C) — convert pooled to match
+                    pooled = pooled.transpose(0, 1).contiguous()  # (Q, B, C)
+
+                    # Gated residual refinement of queries
+                    refine_idx = self.refine_layer_indices.index(i)
+                    delta = self.refine_proj[refine_idx](
+                        self.refine_norm[refine_idx](pooled)
+                    )  # (Q, B, C)
+                    output = output + self.refine_gamma[refine_idx].view(1, 1, -1) * delta
+            # ===============================================================
+
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             
@@ -540,15 +577,10 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, i):
-        if output.shape[0] != self.num_queries:
-            output = output.permute(1, 0, 2).contiguous()
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output)
         mask_embed = self.mask_embed(decoder_output)
-        # print("**************")
-        # print(mask_embed.shape)
-        # print(mask_features.shape)
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         # NOTE: prediction is of higher-resolution
