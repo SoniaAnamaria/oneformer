@@ -318,38 +318,47 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         self.num_heads = nheads
         self.num_layers = dec_layers
         self.channel_first = True
-        downsample_version: str = "v2"
-        use_checkpoint = False
+
+        self.transformer_cross_attention_layers = nn.ModuleList()
+        self.layers = nn.ModuleList()
+        self.query_grid_size = (25, 10)
         dpr = [x.item() for x in torch.linspace(0, 0.1, self.num_layers)]
 
-        self.layers = nn.ModuleList()
-        for _ in range(self.num_layers):
-            downsample = nn.Identity()
+        for i in range(self.num_layers):
+            # keep image-to-query grounding
+            self.transformer_cross_attention_layers.append(
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
 
-            self.layers.append(self._make_layer(
-                dim=hidden_dim,
-                drop_path=[dpr[_]],
-                use_checkpoint=use_checkpoint,
-                downsample=downsample,
-                channel_first=self.channel_first,
-                # =================
-                ssm_d_state=16,
-                ssm_ratio=2.0,
-                ssm_dt_rank="auto",
-                ssm_act_layer=nn.SiLU,
-                ssm_conv=3,
-                ssm_conv_bias=True,
-                ssm_drop_rate=0.0,
-                ssm_init="v0",
-                forward_type="v2",
-                # =================
-                mlp_ratio=4.0,
-                mlp_act_layer=nn.GELU,
-                mlp_drop_rate=0.0,
-                gmlp=False,
-                # =================
-                _SS2D=SS2D,
-            ))
+            # one VMamba/VSS layer per decoder layer
+            self.layers.append(
+                self._make_layer(
+                    dim=hidden_dim,
+                    drop_path=[dpr[i]],
+                    use_checkpoint=False,
+                    downsample=nn.Identity(),
+                    channel_first=self.channel_first,
+                    ssm_d_state=16,
+                    ssm_ratio=2.0,
+                    ssm_dt_rank="auto",
+                    ssm_act_layer=nn.SiLU,
+                    ssm_conv=3,
+                    ssm_conv_bias=True,
+                    ssm_drop_rate=0.0,
+                    ssm_init="v0",
+                    forward_type="v2",
+                    mlp_ratio=4.0,
+                    mlp_act_layer=nn.GELU,
+                    mlp_drop_rate=0.0,
+                    gmlp=False,
+                    _SS2D=SS2D,
+                )
+            )
 
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
@@ -510,15 +519,51 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
 
-            B, N, C = output.shape
-            if B == self.num_queries:
-                output = output.permute(1, 0, 2).contiguous()
-                B, N, C = output.shape
-            output = output.permute(0, 2, 1).reshape(B, C, 25, 10)
-            output = self.layers[i](output)
-            output = output.reshape(B, C, -1).permute(0, 2, 1)
+            # -----------------------------------
+            # 1. Cross-attention: queries attend image features
+            # -----------------------------------
+            output = self.transformer_cross_attention_layers[i](
+                output,
+                src[level_index],
+                memory_mask=attn_mask,
+                memory_key_padding_mask=None,
+                pos=pos[level_index],
+                query_pos=query_embed,
+            )
 
-            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], i=i+1)
+            # --------------------------------------------------
+            # 2. VMamba over all 250 decoder tokens
+            # --------------------------------------------------
+            output_bqc = output.permute(1, 0, 2).contiguous()  # [B, 250, C]
+
+            B, Q, C = output_bqc.shape
+            grid_h, grid_w = self.query_grid_size
+
+            assert Q == grid_h * grid_w, (
+                f"VMamba decoder expects Q == H*W, but got Q={Q}, "
+                f"H={grid_h}, W={grid_w}, H*W={grid_h * grid_w}"
+            )
+
+            output_2d = output_bqc.permute(0, 2, 1).reshape(
+                B, C, grid_h, grid_w
+            )  # [B, C, 25, 10]
+
+            output_2d = self.layers[i](output_2d)
+
+            output = output_2d.flatten(2).permute(
+                2, 0, 1
+            ).contiguous()  # [250, B, C]
+
+            # --------------------------------------------------
+            # 3. Prediction heads
+            # --------------------------------------------------
+            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
+                output,
+                mask_features,
+                attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
+                i=i + 1,
+            )
+
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             
@@ -540,29 +585,40 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, i):
-        if output.shape[0] != self.num_queries:
-            output = output.permute(1, 0, 2).contiguous()
+        # output: [250, B, C]
         decoder_output = self.decoder_norm(output)
-        decoder_output = decoder_output.transpose(0, 1)
-        outputs_class = self.class_embed(decoder_output)
-        mask_embed = self.mask_embed(decoder_output)
-        # print("**************")
-        # print(mask_embed.shape)
-        # print(mask_features.shape)
-        outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+        decoder_output = decoder_output.transpose(0, 1)  # [B, 250, C]
 
-        # NOTE: prediction is of higher-resolution
-        # [B, Q, H, W] -> [B, Q, H*W] -> [B, h, Q, H*W] -> [B*h, Q, HW]
-        attn_mask = F.interpolate(outputs_mask, size=attn_mask_target_size, mode="bilinear", align_corners=False)
-        
-        # save_attn_masks(attn_mask.sigmoid() < 0.5, fname=f'demo/maps/{i}_pre_bool')
-        
-        # must use bool type
-        # If a BoolTensor is provided, positions with ``True`` are not allowed to attend while ``False`` values will be unchanged.
-        attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
+        outputs_class = self.class_embed(decoder_output)
+
+        mask_embed = self.mask_embed(decoder_output)
+
+        outputs_mask = torch.einsum(
+            "bqc,bchw->bqhw",
+            mask_embed,
+            mask_features,
+        )
+
+        attn_mask = F.interpolate(
+            outputs_mask,
+            size=attn_mask_target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        attn_mask = (
+                attn_mask.sigmoid()
+                .flatten(2)
+                .unsqueeze(1)
+                .repeat(1, self.num_heads, 1, 1)
+                .flatten(0, 1)
+                < 0.5
+        ).bool()
+
         attn_mask = attn_mask.detach()
 
         return outputs_class, outputs_mask, attn_mask
+
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks):
