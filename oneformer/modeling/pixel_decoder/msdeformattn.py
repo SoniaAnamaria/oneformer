@@ -24,7 +24,6 @@ from .ops.modules import MSDeformAttn
 
 from ..transformer_decoder.vmamba import VSSM, SS2D
 
-
 # MSDeformAttn Transformer encoder in deformable detr
 class MSDeformAttnTransformerEncoderOnly(nn.Module):
     def __init__(self, d_model=256, nhead=8,
