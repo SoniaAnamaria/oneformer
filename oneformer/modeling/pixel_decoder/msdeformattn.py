@@ -22,6 +22,8 @@ from ..transformer_decoder.position_encoding import PositionEmbeddingSine
 from ..transformer_decoder.transformer import _get_clones, _get_activation_fn
 from .ops.modules import MSDeformAttn
 
+from ..transformer_decoder.vmamba import VSSM, SS2D
+
 
 # MSDeformAttn Transformer encoder in deformable detr
 class MSDeformAttnTransformerEncoderOnly(nn.Module):
@@ -295,6 +297,33 @@ class MSDeformAttnPixelDecoder(nn.Module):
         self.lateral_convs = lateral_convs[::-1]
         self.output_convs = output_convs[::-1]
 
+        self.global_vss = VSSM._make_layer(
+            dim=conv_dim,
+            drop_path=[0.0],
+            use_checkpoint=False,
+            downsample=nn.Identity(),
+            channel_first=True,
+            # =================
+            ssm_d_state=16,
+            ssm_ratio=2.0,
+            ssm_dt_rank="auto",
+            ssm_act_layer=nn.SiLU,
+            ssm_conv=3,
+            ssm_conv_bias=True,
+            ssm_drop_rate=0.0,
+            ssm_init="v0",
+            forward_type="v2",
+            # =================
+            mlp_ratio=4.0,
+            mlp_act_layer=nn.GELU,
+            mlp_drop_rate=0.0,
+            gmlp=False,
+            # =================
+            _SS2D=SS2D,
+        )
+
+        self.vss_gamma = nn.Parameter(torch.zeros(conv_dim))
+
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
         ret = {}
@@ -341,6 +370,10 @@ class MSDeformAttnPixelDecoder(nn.Module):
         num_cur_levels = 0
         for i, z in enumerate(y):
             out.append(z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1]))
+
+        delta = self.global_vss(out[0])  # (B, C, H32, W32)
+        delta = delta * self.vss_gamma.view(1, -1, 1, 1)  # broadcast over (B, C, H, W)
+        out[0] = out[0] + delta
 
         # append `out` with extra FPN levels
         # Reverse feature maps into top-down order (from low to high resolution)
