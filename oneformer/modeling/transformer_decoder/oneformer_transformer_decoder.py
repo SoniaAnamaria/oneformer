@@ -373,10 +373,8 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
         # ===== Mask-aware query refinement with VSS-refined memory =====
-        # Refine the two lowest-res memory scales (indices 0 and 1, i.e. F_1/32 and F_1/16).
-        # F_1/8 (index 2) is left unrefined for cost/benefit reasons.
-        self.vss_refine_scales = [0, 1]
-        self.refine_from_layer = 3  # apply from decoder layer 3 onward
+        self.refine_level = 1  # only 1/16
+        self.vss_refine_scales = [1]  # only refine 1/16 memory
 
         self.memory_vss = nn.ModuleList()
         for _ in self.vss_refine_scales:
@@ -401,7 +399,9 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
             ))
 
         # Per-refinement-layer projection, norm, gated residual scale.
-        self.refine_layer_indices = list(range(self.refine_from_layer, self.num_layers))  # [3..N-1]
+        # Use only the last decoder layer that attends to 1/16.
+        last_16_layer = max(i for i in range(self.num_layers) if i % self.num_feature_levels == self.refine_level)
+        self.refine_layer_indices = [last_16_layer]
         self.refine_norm = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in self.refine_layer_indices])
         self.refine_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in self.refine_layer_indices])
         self.refine_gamma = nn.ParameterList([
@@ -523,9 +523,6 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
 
             # ===== Mask-aware query refinement using VSS-refined memory =====
             if i in self.refine_layer_indices:
-                # The next layer will use scale `(i+1) % num_feature_levels`; we use the
-                # current layer's scale for pooling, which matches the resolution at which
-                # this layer's cross-attention operated.
                 pool_scale = level_index
                 if pool_scale in refined_memory_2d:
                     F_refined = refined_memory_2d[pool_scale]  # (B, C, H, W)
@@ -536,7 +533,7 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
                     mask_for_pool = F.interpolate(
                         outputs_mask, size=(H, W), mode="bilinear", align_corners=False
                     )  # (B, Q, H, W)
-                    w = mask_for_pool.sigmoid()  # (B, Q, H, W)
+                    w = mask_for_pool.detach().sigmoid()  # (B, Q, H, W)
 
                     # Mask-weighted average pooling
                     w_flat = w.flatten(2)  # (B, Q, H*W)
