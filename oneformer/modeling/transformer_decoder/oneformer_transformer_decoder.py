@@ -12,12 +12,14 @@ from torch.nn import functional as F
 
 from detectron2.config import configurable
 from detectron2.layers import Conv2d
+from torch.utils.backcompat import keepdim_warning
 
 from .position_encoding import PositionEmbeddingSine
 from .transformer import Transformer
 
 from detectron2.utils.registry import Registry
 
+from .vmamba import VSSM, SS2D
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
 TRANSFORMER_DECODER_REGISTRY.__doc__ = """
@@ -371,6 +373,45 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
+        # Mask-aware query refinement with VSS-refined memory
+        self.vss_refine_scales = [0,1]
+        self.refine_from_layer = 3
+
+        self.memory_vss = nn.ModuleList()
+        for _ in self.vss_refine_scales:
+            self.memory_vss.append(VSSM._make_layer(
+                dim=hidden_dim,
+                drop_path=[0.0],
+                use_checkpoint=False,
+                downsample=nn.Identity(),
+                channel_first=True,
+                # =================
+                ssm_d_state=16,
+                ssm_ratio=2.0,
+                ssm_dt_rank="auto",
+                ssm_act_layer=nn.SiLU,
+                ssm_conv=3,
+                ssm_conv_bias=True,
+                ssm_drop_rate=0.0,
+                ssm_init="v0",
+                forward_type="v2",
+                # =================
+                mlp_ratio=4.0,
+                mlp_act_layer=nn.GELU,
+                mlp_drop_rate=0.0,
+                gmlp=False,
+                # =================
+                _SS2D=SS2D,
+            ))
+
+        self.refine_layer_indices = list(range(self.refine_from_layer, self.num_layers))
+        self.refine_norm = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in self.refine_layer_indices])
+        self.refine_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in self.refine_layer_indices])
+        self.refine_gamma = nn.ParameterList([
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in self.refine_layer_indices
+        ])
+
+
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
         ret = {}
@@ -412,14 +453,22 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         # disable mask, it does not affect performance
         del mask
 
+        projected = []
         for i in range(self.num_feature_levels):
             size_list.append(x[i].shape[-2:])
             pos.append(self.pe_layer(x[i], None).flatten(2))
-            src.append(self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
+            proj = self.input_proj[i](x[i])
+            projected.append(proj)
+            src.append(proj.flatten(2) + self.level_embed.weight[i][None, :, None])
 
             # flatten NxCxHxW to HWxNxC
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)
+
+        # Precompute VSS-refined memory for mask-aware pooling
+        refined_memory_2d = {}
+        for j, scale_idx in enumerate(self.vss_refine_scales):
+            refined_memory_2d[scale_idx] = self.memory_vss[j](projected[scale_idx])
 
         _, bs, _ = src[0].shape
 
@@ -472,6 +521,33 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
             )
 
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], i=i+1)
+
+            # Mask-aware query refinement using VSS-refined memory
+            if i in self.refine_layer_indices:
+                pool_scale = level_index
+                if pool_scale in refined_memory_2d:
+                    F_refined = refined_memory_2d[pool_scale]  # (B, C, H, W)
+                    B, C, H, W = F_refined.shape
+
+                    mask_for_pool = F.interpolate(
+                        outputs_mask, size = (H, W), mode = "bilinear", align_corners= False
+                    )
+                    w = mask_for_pool.sigmoid() # (B, Q, H, W)
+
+                    w_flat = w.flatten(2)  # (B, Q, H*W)
+                    F_flat = F_refined.flatten(2)   # (B, C, H*W)
+                    num = torch.einsum("bqp,bcp->bqc", w_flat, F_flat)  # (B, Q, C)
+                    den = w_flat.sum(dim=-1, keepdim=True).clamp_min(1e-6)   # (B, Q, 1)
+                    pooled = num/den    # (B, Q, C)
+
+                    pooled = pooled.transpose(0, 1).contiguous()  # (Q, B, C)
+
+                    refine_idx = self.refine_layer_indices.index(i)
+                    delta = self.refine_proj[refine_idx](
+                        self.refine_norm[refine_idx](pooled)
+                    )
+                    output = output + self.refine_gamma[refine_idx].view(1, 1, -1) * delta
+
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             
