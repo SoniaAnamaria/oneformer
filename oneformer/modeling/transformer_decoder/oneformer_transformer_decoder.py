@@ -374,8 +374,8 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
         # Mask-aware query refinement with VSS-refined memory
-        self.vss_refine_scales = [0,1]
-        self.refine_from_layer = 3
+        self.vss_refine_scales = [1]
+        self.refine_level = 1
 
         self.memory_vss = nn.ModuleList()
         for _ in self.vss_refine_scales:
@@ -404,7 +404,8 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
                 _SS2D=SS2D,
             ))
 
-        self.refine_layer_indices = list(range(self.refine_from_layer, self.num_layers))
+        last_16_layer = max(i for i in range(self.num_layers) if i % self.num_feature_levels == self.refine_level)
+        self.refine_layer_indices = [last_16_layer]
         self.refine_norm = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in self.refine_layer_indices])
         self.refine_proj = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in self.refine_layer_indices])
         self.refine_gamma = nn.ParameterList([
@@ -532,7 +533,7 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
                     mask_for_pool = F.interpolate(
                         outputs_mask, size = (H, W), mode = "bilinear", align_corners= False
                     )
-                    w = mask_for_pool.sigmoid() # (B, Q, H, W)
+                    w = mask_for_pool.detach().sigmoid() # (B, Q, H, W)
 
                     w_flat = w.flatten(2)  # (B, Q, H*W)
                     F_flat = F_refined.flatten(2)   # (B, C, H*W)
@@ -571,7 +572,7 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, i):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
-        outputs_class = self.class_embed(decoder_output)
+        outputs_class = self.class_embed(decoder_output.float())
         mask_embed = self.mask_embed(decoder_output)
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
