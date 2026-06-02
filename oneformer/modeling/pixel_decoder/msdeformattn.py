@@ -323,32 +323,6 @@ class MSDeformAttnPixelDecoder(nn.Module):
 
         self.vss_gamma = nn.Parameter(torch.zeros(conv_dim))
 
-        self.global_vvs_16 = VSSM._make_layer(
-            dim=conv_dim,
-            drop_path=[0.0],
-            use_checkpoint=False,
-            downsample=nn.Identity(),
-            channel_first=True,
-            # =================
-            ssm_d_state=16,
-            ssm_ratio=2.0,
-            ssm_dt_rank="auto",
-            ssm_act_layer=nn.SiLU,
-            ssm_conv=3,
-            ssm_conv_bias=True,
-            ssm_drop_rate=0.0,
-            ssm_init="v0",
-            forward_type="v2",
-            # =================
-            mlp_ratio=4.0,
-            mlp_act_layer=nn.GELU,
-            mlp_drop_rate=0.0,
-            gmlp=False,
-            # =================
-            _SS2D=SS2D,
-        )
-
-        self.vss_gamma_16 = nn.Parameter(torch.zeros(conv_dim))
 
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
@@ -400,10 +374,6 @@ class MSDeformAttnPixelDecoder(nn.Module):
         delta = self.global_vss(out[0])  # (B, C, H32, W32)
         delta = delta * self.vss_gamma.view(1, -1, 1, 1)  # broadcast over (B, C, H, W)
         out[0] = out[0] + delta
-
-        delta_16 = self.global_vvs_16(out[1])
-        delta_16 = delta_16 * self.vss_gamma_16.view(1, -1, 1, 1)
-        out[1] = out[1] + delta_16
 
         # append `out` with extra FPN levels
         # Reverse feature maps into top-down order (from low to high resolution)
