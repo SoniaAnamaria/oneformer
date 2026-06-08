@@ -354,6 +354,10 @@ class MSDeformAttnPixelDecoder(nn.Module):
             srcs.append(self.input_proj[idx](x))
             pos.append(self.pe_layer(x))
 
+        delta = self.global_vss(srcs[0])
+        delta = delta * self.vss_gamma.view(1, -1, 1, 1)
+        srcs[0] = srcs[0] + delta
+
         y, spatial_shapes, level_start_index, valid_ratios = self.transformer(srcs, pos)
         bs = y.shape[0]
 
@@ -370,10 +374,6 @@ class MSDeformAttnPixelDecoder(nn.Module):
         num_cur_levels = 0
         for i, z in enumerate(y):
             out.append(z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1]))
-
-        delta = self.global_vss(out[0])  # (B, C, H32, W32)
-        delta = delta * self.vss_gamma.view(1, -1, 1, 1)  # broadcast over (B, C, H, W)
-        out[0] = out[0] + delta
 
         # append `out` with extra FPN levels
         # Reverse feature maps into top-down order (from low to high resolution)
