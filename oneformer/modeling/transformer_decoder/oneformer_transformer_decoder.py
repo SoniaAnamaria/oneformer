@@ -18,6 +18,7 @@ from .transformer import Transformer
 
 from detectron2.utils.registry import Registry
 
+from .vmamba import VSSM, SS2D
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
 TRANSFORMER_DECODER_REGISTRY.__doc__ = """
@@ -371,6 +372,33 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
+        self.query_init_vss = VSSM._make_layer(
+            dim=mask_dim,
+            drop_path=[0.0],
+            use_checkpoint=False,
+            downsample=nn.Identity(),
+            channel_first=True,
+            # =================
+            ssm_d_state=16,
+            ssm_ratio=2.0,
+            ssm_dt_rank="auto",
+            ssm_act_layer=nn.SiLU,
+            ssm_conv=3,
+            ssm_conv_bias=True,
+            ssm_drop_rate=0.0,
+            ssm_init="v0",
+            forward_type="v2",
+            # =================
+            mlp_ratio=4.0,
+            mlp_act_layer=nn.GELU,
+            mlp_drop_rate=0.0,
+            gmlp=False,
+            # =================
+            _SS2D=SS2D,
+        )
+
+        self.query_init_gamma = nn.Parameter(torch.zeros(mask_dim))
+
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
         ret = {}
@@ -431,9 +459,13 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         
         feats = self.pe_layer(mask_features, None)
 
+        delta = self.query_init_vss(mask_features)
+        delta = delta * self.query_init_gamma.view(1, -1, 1, 1)
+        mask_features_for_init = mask_features + delta
+
         out_t, _ = self.class_transformer(feats, None, 
                                     self.query_embed.weight[:-1], 
-                                    self.class_input_proj(mask_features),
+                                    self.class_input_proj(mask_features_for_init),
                                     tasks if self.use_task_norm else None)
         out_t = out_t[0].permute(1, 0, 2)
         
