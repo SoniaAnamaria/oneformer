@@ -371,9 +371,9 @@ class MSDeformAttnPixelDecoder(nn.Module):
         for i, z in enumerate(y):
             out.append(z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1]))
 
-        delta = self.global_vss(out[0])
+        delta = self.global_vss(out[1])
         delta = delta * self.vss_gamma.view(1, -1, 1, 1)
-        out[0] = out[0] + delta
+        out[1] = out[1] + delta
 
         # append `out` with extra FPN levels
         # Reverse feature maps into top-down order (from low to high resolution)
