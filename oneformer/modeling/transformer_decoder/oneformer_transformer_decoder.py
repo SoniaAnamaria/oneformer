@@ -12,7 +12,7 @@ from torch.nn import functional as F
 
 from detectron2.config import configurable
 from detectron2.layers import Conv2d
-from torch.utils.backcompat import keepdim_warning
+from torch.cuda.amp import autocast
 
 from .position_encoding import PositionEmbeddingSine
 from .transformer import Transformer
@@ -466,10 +466,12 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)
 
-        # Precompute VSS-refined memory for mask-aware pooling
+        # Precompute VSS-refined memory for mask-aware pooling. Kept in fp32:
+        # the selective scan and the pooling sums are not fp16-safe under AMP.
         refined_memory_2d = {}
-        for j, scale_idx in enumerate(self.vss_refine_scales):
-            refined_memory_2d[scale_idx] = self.memory_vss[j](projected[scale_idx])
+        with autocast(enabled=False):
+            for j, scale_idx in enumerate(self.vss_refine_scales):
+                refined_memory_2d[scale_idx] = self.memory_vss[j](projected[scale_idx].float())
 
         _, bs, _ = src[0].shape
 
@@ -521,33 +523,18 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
                 output
             )
 
+            # Mask-aware query refinement using VSS-refined memory. Applied
+            # before this layer's prediction heads so the refined queries are
+            # supervised by this layer's aux loss and every later layer.
+            # `outputs_mask` here is the previous prediction -- the same one
+            # whose attn_mask gated this layer's cross-attention.
+            if i in self.refine_layer_indices and level_index in refined_memory_2d:
+                output = self._refine_queries(
+                    output, outputs_mask, refined_memory_2d[level_index],
+                    self.refine_layer_indices.index(i),
+                )
+
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels], i=i+1)
-
-            # Mask-aware query refinement using VSS-refined memory
-            if i in self.refine_layer_indices:
-                pool_scale = level_index
-                if pool_scale in refined_memory_2d:
-                    F_refined = refined_memory_2d[pool_scale]  # (B, C, H, W)
-                    B, C, H, W = F_refined.shape
-
-                    mask_for_pool = F.interpolate(
-                        outputs_mask, size = (H, W), mode = "bilinear", align_corners= False
-                    )
-                    w = mask_for_pool.detach().sigmoid() # (B, Q, H, W)
-
-                    w_flat = w.flatten(2)  # (B, Q, H*W)
-                    F_flat = F_refined.flatten(2)   # (B, C, H*W)
-                    num = torch.einsum("bqp,bcp->bqc", w_flat, F_flat)  # (B, Q, C)
-                    den = w_flat.sum(dim=-1, keepdim=True).clamp_min(1e-6)   # (B, Q, 1)
-                    pooled = num/den    # (B, Q, C)
-
-                    pooled = pooled.transpose(0, 1).contiguous()  # (Q, B, C)
-
-                    refine_idx = self.refine_layer_indices.index(i)
-                    delta = self.refine_proj[refine_idx](
-                        self.refine_norm[refine_idx](pooled)
-                    )
-                    output = output + self.refine_gamma[refine_idx].view(1, 1, -1) * delta
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
@@ -568,6 +555,36 @@ class ContrastiveMultiScaleMaskedTransformerDecoder(nn.Module):
         }
 
         return out
+
+    def _refine_queries(self, output, outputs_mask, memory_2d, refine_idx):
+        """Pool VSS-refined memory into the object queries, weighted by each
+        query's own predicted mask.
+
+        output: (Q, B, C); the last row is the task token and is left untouched.
+        outputs_mask: (B, Q, Hm, Wm) mask logits from the previous prediction heads.
+        memory_2d: (B, C, H, W), fp32.
+        """
+        B, C, H, W = memory_2d.shape
+        with autocast(enabled=False):
+            w = F.interpolate(
+                outputs_mask.detach().float(), size=(H, W), mode="bilinear", align_corners=False
+            ).sigmoid()
+            w_flat = w.flatten(2)  # (B, Q, P)
+            f_flat = memory_2d.flatten(2)  # (B, C, P)
+            pooled = torch.einsum("bqp,bcp->bqc", w_flat, f_flat)
+            pooled = pooled / w_flat.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            # No-object queries have near-empty masks, so they all pool to the
+            # same global feature average; gate their delta to ~0 so the
+            # refinement only moves queries that own a region.
+            conf = w_flat.amax(dim=-1, keepdim=True)  # (B, Q, 1)
+
+        pooled = pooled.transpose(0, 1).to(output.dtype)  # (Q, B, C)
+        conf = conf.transpose(0, 1).to(output.dtype)  # (Q, B, 1)
+        delta = self.refine_proj[refine_idx](self.refine_norm[refine_idx](pooled))
+        # Gate after norm/proj: LayerNorm is scale-invariant, so applying the
+        # confidence to `pooled` before it would cancel out.
+        delta = conf * self.refine_gamma[refine_idx].view(1, 1, -1) * delta
+        return torch.cat([output[:-1] + delta[:-1], output[-1:]], dim=0)
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, i):
         decoder_output = self.decoder_norm(output)

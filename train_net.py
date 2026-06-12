@@ -62,7 +62,7 @@ from oneformer import (
     add_convnext_config,
 )
 
-from detectron2.utils.events import CommonMetricPrinter, JSONWriter
+from detectron2.utils.events import CommonMetricPrinter, JSONWriter, get_event_storage
 from oneformer.utils.events import WandbWriter, setup_wandb
 from time import sleep
 from oneformer.data.build import *
@@ -72,6 +72,19 @@ class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to OneFormer.
     """
+
+    def run_step(self):
+        super().run_step()
+        # DefaultTrainer has no self.model; the (possibly DDP-wrapped) model lives on self._trainer
+        if not hasattr(self, "_vss_gamma_params"):
+            self._vss_gamma_params = [
+                (name, param)
+                for name, param in self._trainer.model.named_parameters()
+                if "vss_gamma" in name
+            ]
+        storage = get_event_storage()
+        for name, param in self._vss_gamma_params:
+            storage.put_scalar(f"params/{name}", param.abs().mean().item(), smoothing_hint=False)
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -248,6 +261,14 @@ class Trainer(DefaultTrainer):
                     hyperparams["weight_decay"] = weight_decay_norm
                 if isinstance(module, torch.nn.Embedding):
                     hyperparams["weight_decay"] = weight_decay_embed
+                # gate and SSM state parameters: decaying them toward zero biases
+                # the parameterization rather than regularizing capacity
+                # (refine_gamma is a ParameterList, so it matches on module_name)
+                if (
+                    module_param_name in {"vss_gamma", "A_logs", "Ds", "dt_projs_bias"}
+                    or "refine_gamma" in module_name
+                ):
+                    hyperparams["weight_decay"] = 0.0
                 params.append({"params": [value], **hyperparams})
 
         def maybe_add_full_model_gradient_clipping(optim):
