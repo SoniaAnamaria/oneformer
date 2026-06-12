@@ -261,14 +261,6 @@ class Trainer(DefaultTrainer):
                     hyperparams["weight_decay"] = weight_decay_norm
                 if isinstance(module, torch.nn.Embedding):
                     hyperparams["weight_decay"] = weight_decay_embed
-                # gate and SSM state parameters: decaying them toward zero biases
-                # the parameterization rather than regularizing capacity
-                # (refine_gamma is a ParameterList, so it matches on module_name)
-                if (
-                    module_param_name in {"vss_gamma", "A_logs", "Ds", "dt_projs_bias"}
-                    or "refine_gamma" in module_name
-                ):
-                    hyperparams["weight_decay"] = 0.0
                 params.append({"params": [value], **hyperparams})
 
         def maybe_add_full_model_gradient_clipping(optim):
