@@ -261,13 +261,12 @@ class Trainer(DefaultTrainer):
                     hyperparams["weight_decay"] = weight_decay_norm
                 if isinstance(module, torch.nn.Embedding):
                     hyperparams["weight_decay"] = weight_decay_embed
-                # gate and SSM state parameters: decaying them toward zero biases
-                # the parameterization rather than regularizing capacity
-                # (refine_gamma is a ParameterList, so it matches on module_name)
-                if (
-                    module_param_name in {"vss_gamma", "A_logs", "Ds", "dt_projs_bias"}
-                    or "refine_gamma" in module_name
-                ):
+                # Exclude only the refinement gate, which does not exist in the
+                # 1/32 reference run: decaying a zero-init gate pins it shut,
+                # while the shared VSS params keep weight decay so the
+                # comparison stays single-variable. (ParameterList entries are
+                # named "0", "1", ..., hence the module_name match.)
+                if "refine_gamma" in module_name:
                     hyperparams["weight_decay"] = 0.0
                 params.append({"params": [value], **hyperparams})
 
