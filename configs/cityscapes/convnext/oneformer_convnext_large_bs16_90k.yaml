@@ -1,4 +1,5 @@
 _BASE_: ../oneformer_R50_bs16_90k.yaml
+SEED: 42
 MODEL:
   BACKBONE:
     NAME: "D2ConvNeXt"
